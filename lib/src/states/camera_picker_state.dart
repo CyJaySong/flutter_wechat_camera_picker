@@ -132,6 +132,10 @@ class CameraPickerState extends State<CameraPicker>
   /// 但如果录像时间没有限制，定时器将不会起作用。
   Timer? recordCountdownTimer;
 
+  /// The current in-flight stop recording operation.
+  /// 当前正在进行中的停止录制操作
+  Future<XFile?>? stopRecordingFuture;
+
   /// The [Stopwatch] to monitor if the record has reached
   /// the minimum record duration requirement.
   /// 录像时长计时器，用来检测是否达到了最短录制时长。
@@ -202,9 +206,15 @@ class CameraPickerState extends State<CameraPicker>
   bool get isRecordingVideo => innerController?.value.isRecordingVideo ?? false;
 
   /// Whether the capture button is displaying.
+  ///
+  /// In tap recording mode, the button should remain visible during recording
+  /// even if the pointer state has been cancelled by the platform.
+  /// 在轻触录像模式下，即使平台打断了点击态，录制期间也需要持续展示按钮。
   bool get shouldCaptureButtonDisplay =>
-      (isCaptureButtonTapDown || MediaQuery.accessibleNavigationOf(context)) &&
-      isRecordingVideo;
+      isRecordingVideo &&
+      (enableTapRecording ||
+          isCaptureButtonTapDown ||
+          MediaQuery.accessibleNavigationOf(context));
 
   /// Whether the camera preview should be rotated.
   bool get isCameraRotated => pickerConfig.cameraQuarterTurns % 4 != 0;
@@ -272,7 +282,10 @@ class CameraPickerState extends State<CameraPicker>
     ambiguate(WidgetsBinding.instance)?.removeObserver(this);
     final c = innerController;
     innerController = null;
-    c?.dispose();
+    // Dispose can not be async, so release the controller in background.
+    // `_disposeCameraController` will stop an active recording before dispose.
+    // `dispose` 无法直接异步等待，这里通过后台任务完成控制器释放。
+    unawaited(_disposeCameraController(c));
     currentExposureOffset.dispose();
     currentExposureSliderOffset.dispose();
     lastExposurePoint.dispose();
@@ -287,10 +300,39 @@ class CameraPickerState extends State<CameraPicker>
     super.dispose();
   }
 
+  /// 销毁相机控制器。
+  ///
+  /// 当页面在录像期间被关闭时，需要先显式停止录像，
+  /// 否则持久化录制会话可能残留，影响下一次进入页面后的录制流程。
+  Future<void> _disposeCameraController(CameraController? controller) async {
+    if (controller == null) {
+      return;
+    }
+    try {
+      if (controller.value.isInitialized && controller.value.isRecordingVideo) {
+        _clearInterruptedRecordingState();
+        final stopResult = await _stopRecordingForController(controller);
+        if (stopResult.startedByCaller && stopResult.file != null) {
+          await _deleteCapturedFile(stopResult.file!);
+        }
+      }
+    } catch (e, s) {
+      realDebugPrint('Failed to stop recording while disposing controller: $e');
+      pickerConfig.onError?.call(e, s);
+    } finally {
+      await controller.dispose();
+    }
+  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final CameraController? c = innerController;
     if (state == AppLifecycleState.resumed && !accessDenied) {
+      // 录像期间不要重建控制器，否则返回页面后会丢失停止当前录制的能力。
+      if (c != null && c.value.isInitialized && c.value.isRecordingVideo) {
+        safeSetState(() {});
+        return;
+      }
       initCameras(
         cameraDescription: cameras.elementAtOrNull(currentCameraIndex),
       );
@@ -298,9 +340,87 @@ class CameraPickerState extends State<CameraPicker>
       // App state changed before we got the chance to initialize.
       return;
     } else if (state == AppLifecycleState.inactive) {
+      // `camera` 默认使用持久化录制，录像期间必须显式 stop 才能正确收尾。
+      // 如果系统手势触发 inactive 时直接销毁控制器，轻触录像返回后会无法停止录制。
+      if (c.value.isRecordingVideo) {
+        return;
+      }
+      _clearInterruptedRecordingState();
       c.dispose();
       innerController = null;
       isControllerBusy = false;
+    }
+  }
+
+  /// 清理因生命周期中断而失效的录制状态。
+  void _clearInterruptedRecordingState() {
+    recordDetectTimer?.cancel();
+    recordDetectTimer = null;
+    _clearRecordCountdownTimer();
+    recordStopwatch
+      ..stop()
+      ..reset();
+    isShootingButtonAnimate = false;
+    isCaptureButtonTapDown = false;
+    lastShootingButtonPressedPosition = null;
+  }
+
+  /// 清理录制时长限制使用的倒计时定时器，避免上一轮录制影响下一轮。
+  void _clearRecordCountdownTimer() {
+    recordCountdownTimer?.cancel();
+    recordCountdownTimer = null;
+  }
+
+  /// Whether the current state can continue handling a stopped recording.
+  /// 当前页面是否仍然可以继续处理停止录制后的结果
+  bool _canHandleStoppedRecording(CameraController controller) =>
+      mounted && identical(innerController, controller);
+
+  /// Stop the platform recording once and share the same result with joiners.
+  /// 执行一次底层停止录制，并让后续调用复用同一个结果
+  Future<_StopRecordingResult> _stopRecordingForController(
+    CameraController controller,
+  ) async {
+    final currentFuture = stopRecordingFuture;
+    if (currentFuture != null) {
+      return _StopRecordingResult(
+        file: await currentFuture,
+        startedByCaller: false,
+      );
+    }
+    final future = _stopRecordingOnPlatform(controller);
+    stopRecordingFuture = future;
+    try {
+      return _StopRecordingResult(file: await future, startedByCaller: true);
+    } finally {
+      if (identical(stopRecordingFuture, future)) {
+        stopRecordingFuture = null;
+      }
+    }
+  }
+
+  /// Stop recording on the platform side without any UI side effects.
+  /// 仅执行底层停止录制，不处理任何 UI 后续逻辑
+  Future<XFile?> _stopRecordingOnPlatform(CameraController controller) async {
+    _clearRecordCountdownTimer();
+    if (!controller.value.isInitialized || !controller.value.isRecordingVideo) {
+      return null;
+    }
+    return controller.stopVideoRecording();
+  }
+
+  /// Delete a captured file if it still exists.
+  /// 如果拍摄文件仍然存在，则将其删除
+  Future<void> _deleteCapturedFile(XFile file) async {
+    final capturedFile = File(file.path);
+    if (!await capturedFile.exists()) {
+      return;
+    }
+    try {
+      await capturedFile.delete();
+    } catch (e, s) {
+      realDebugPrint('Failed to delete captured file: $e');
+      pickerConfig.onError?.call(e, s);
     }
   }
 
@@ -1017,6 +1137,10 @@ class CameraPickerState extends State<CameraPicker>
     }
     isControllerBusy = true;
     try {
+      // Clear the previous countdown first to avoid the old timer stopping the
+      // next recording unexpectedly.
+      // 先清理上一轮的倒计时，避免旧定时器提前终止新一轮录制。
+      _clearRecordCountdownTimer();
       await controller.startVideoRecording();
       if (isRecordingRestricted) {
         recordCountdownTimer = Timer(
@@ -1035,7 +1159,7 @@ class CameraPickerState extends State<CameraPicker>
       try {
         await controller.stopVideoRecording();
       } catch (e, s) {
-        recordCountdownTimer?.cancel();
+        _clearRecordCountdownTimer();
         isShootingButtonAnimate = false;
         handleErrorWithHandler(e, s, pickerConfig.onError);
       } finally {
@@ -1056,8 +1180,10 @@ class CameraPickerState extends State<CameraPicker>
     }
 
     recordStopwatch.stop();
-    if (innerController == null || !controller.value.isRecordingVideo) {
-      recordCountdownTimer?.cancel();
+    final currentController = innerController;
+    if (currentController == null ||
+        !currentController.value.isRecordingVideo) {
+      _clearRecordCountdownTimer();
       safeSetState(() {
         isControllerBusy = false;
         isShootingButtonAnimate = false;
@@ -1069,12 +1195,25 @@ class CameraPickerState extends State<CameraPicker>
       lastShootingButtonPressedPosition = null;
     });
     try {
-      final XFile file = await controller.stopVideoRecording();
+      final stopResult = await _stopRecordingForController(currentController);
+      final XFile? file = stopResult.file;
+      if (file == null) {
+        return;
+      }
+      if (!_canHandleStoppedRecording(currentController)) {
+        await _deleteCapturedFile(file);
+        return;
+      }
       if (recordStopwatch.elapsed < minimumRecordingDuration) {
+        await _deleteCapturedFile(file);
         pickerConfig.onMinimumRecordDurationNotMet?.call();
         return;
       }
-      controller.pausePreview();
+      await currentController.pausePreview();
+      if (!_canHandleStoppedRecording(currentController)) {
+        await _deleteCapturedFile(file);
+        return;
+      }
       final bool? isCapturedFileHandled = pickerConfig.onXFileCaptured?.call(
         file,
         CameraPickerViewType.video,
@@ -1086,19 +1225,24 @@ class CameraPickerState extends State<CameraPicker>
         file: file,
         viewType: CameraPickerViewType.video,
       );
+      if (!_canHandleStoppedRecording(currentController)) {
+        return;
+      }
       if (entity != null) {
         if (pickerConfig.onPickConfirmed case final onPickConfirmed?) {
-          await innerController?.resumePreview();
+          await currentController.resumePreview();
           onPickConfirmed(entity);
         } else {
           Navigator.of(context).pop(entity);
         }
       } else {
-        await innerController?.resumePreview();
+        await currentController.resumePreview();
       }
     } catch (e, s) {
-      recordCountdownTimer?.cancel();
-      initCameras();
+      _clearRecordCountdownTimer();
+      if (mounted) {
+        initCameras();
+      }
       handleErrorWithHandler(e, s, pickerConfig.onError);
     } finally {
       safeSetState(() {
@@ -1446,12 +1590,20 @@ class CameraPickerState extends State<CameraPicker>
     required BuildContext context,
     required BoxConstraints constraints,
   }) {
-    final showProgressIndicator =
-        isCaptureButtonTapDown || MediaQuery.accessibleNavigationOf(context);
+    // Tap recording should keep the button visible after the gesture ends.
+    // 轻触录像开始后，即使点击手势结束，按钮也应继续可见。
+    final keepCaptureButtonVisible = enableTapRecording && isRecordingVideo;
+    final showProgressIndicator = keepCaptureButtonVisible ||
+        isCaptureButtonTapDown ||
+        MediaQuery.accessibleNavigationOf(context);
 
     if (!showProgressIndicator && isRecordingVideo) {
       return const SizedBox.shrink();
     }
+    // Reuse the same visual "pressed" state while tap-recording is active.
+    // 轻触录像进行中沿用按下态的视觉表现，避免按钮突然缩回。
+    final captureButtonActive =
+        isCaptureButtonTapDown || keepCaptureButtonVisible;
     const size = Size.square(82.0);
     return MergeSemantics(
       child: Semantics(
@@ -1491,7 +1643,7 @@ class CameraPickerState extends State<CameraPicker>
                 children: [
                   AnimatedContainer(
                     duration: const Duration(microseconds: 100),
-                    padding: EdgeInsets.all(isCaptureButtonTapDown ? 16 : 8),
+                    padding: EdgeInsets.all(captureButtonActive ? 16 : 8),
                     decoration: BoxDecoration(
                       border: Border.all(
                         color: Colors.white,
@@ -2080,4 +2232,14 @@ class CameraPickerState extends State<CameraPicker>
       ),
     );
   }
+}
+
+final class _StopRecordingResult {
+  const _StopRecordingResult({
+    required this.file,
+    required this.startedByCaller,
+  });
+
+  final XFile? file;
+  final bool startedByCaller;
 }
