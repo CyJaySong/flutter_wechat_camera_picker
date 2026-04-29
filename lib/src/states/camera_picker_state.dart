@@ -283,9 +283,9 @@ class CameraPickerState extends State<CameraPicker>
     final c = innerController;
     innerController = null;
     // Dispose can not be async, so release the controller in background.
-    // `_disposeCameraController` will stop an active recording before dispose.
-    // `dispose` 无法直接异步等待，这里通过后台任务完成控制器释放。
-    unawaited(_disposeCameraController(c));
+    // `dispose` 无法直接异步等待，这里捕获当前控制器后在后台完成释放。
+    // 先断开 `innerController`，避免异步清理过程中后续逻辑继续操作旧实例。
+    unawaited(disposeCameraController(c));
     currentExposureOffset.dispose();
     currentExposureSliderOffset.dispose();
     lastExposurePoint.dispose();
@@ -300,27 +300,23 @@ class CameraPickerState extends State<CameraPicker>
     super.dispose();
   }
 
-  /// 销毁相机控制器。
-  ///
-  /// 当页面在录像期间被关闭时，需要先显式停止录像，
-  /// 否则持久化录制会话可能残留，影响下一次进入页面后的录制流程。
-  Future<void> _disposeCameraController(CameraController? controller) async {
+  /// Dispose the given [controller] asynchronously.
+  /// 异步释放指定的控制器，子类可按需覆写销毁流程。
+  Future<void> disposeCameraController(CameraController? controller) async {
     if (controller == null) {
       return;
     }
+    XFile? file;
     try {
-      if (controller.value.isInitialized && controller.value.isRecordingVideo) {
-        _clearInterruptedRecordingState();
-        final stopResult = await _stopRecordingForController(controller);
-        if (stopResult.startedByCaller && stopResult.file != null) {
-          await _deleteCapturedFile(stopResult.file!);
-        }
-      }
+      file = await stopRecordingBeforeDispose(controller);
     } catch (e, s) {
       realDebugPrint('Failed to stop recording while disposing controller: $e');
       pickerConfig.onError?.call(e, s);
     } finally {
       await controller.dispose();
+      if (file != null) {
+        await deleteCapturedFile(file);
+      }
     }
   }
 
@@ -345,7 +341,7 @@ class CameraPickerState extends State<CameraPicker>
       if (c.value.isRecordingVideo) {
         return;
       }
-      _clearInterruptedRecordingState();
+      clearInterruptedRecordingState();
       c.dispose();
       innerController = null;
       isControllerBusy = false;
@@ -353,10 +349,10 @@ class CameraPickerState extends State<CameraPicker>
   }
 
   /// 清理因生命周期中断而失效的录制状态。
-  void _clearInterruptedRecordingState() {
+  void clearInterruptedRecordingState() {
     recordDetectTimer?.cancel();
     recordDetectTimer = null;
-    _clearRecordCountdownTimer();
+    clearRecordCountdownTimer();
     recordStopwatch
       ..stop()
       ..reset();
@@ -366,32 +362,39 @@ class CameraPickerState extends State<CameraPicker>
   }
 
   /// 清理录制时长限制使用的倒计时定时器，避免上一轮录制影响下一轮。
-  void _clearRecordCountdownTimer() {
+  void clearRecordCountdownTimer() {
     recordCountdownTimer?.cancel();
     recordCountdownTimer = null;
   }
 
   /// Whether the current state can continue handling a stopped recording.
   /// 当前页面是否仍然可以继续处理停止录制后的结果
-  bool _canHandleStoppedRecording(CameraController controller) =>
+  bool canHandleStoppedRecording(CameraController controller) =>
       mounted && identical(innerController, controller);
+
+  /// Stop the active recording before disposing the controller.
+  /// 在销毁控制器前停止当前录制，子类可覆写中断清理策略。
+  Future<XFile?> stopRecordingBeforeDispose(CameraController controller) async {
+    if (!controller.value.isInitialized || !controller.value.isRecordingVideo) {
+      return null;
+    }
+    clearInterruptedRecordingState();
+    return await stopRecordingForController(controller);
+  }
 
   /// Stop the platform recording once and share the same result with joiners.
   /// 执行一次底层停止录制，并让后续调用复用同一个结果
-  Future<_StopRecordingResult> _stopRecordingForController(
+  Future<XFile?> stopRecordingForController(
     CameraController controller,
   ) async {
     final currentFuture = stopRecordingFuture;
     if (currentFuture != null) {
-      return _StopRecordingResult(
-        file: await currentFuture,
-        startedByCaller: false,
-      );
+      return await currentFuture;
     }
-    final future = _stopRecordingOnPlatform(controller);
+    final future = stopRecordingOnPlatform(controller);
     stopRecordingFuture = future;
     try {
-      return _StopRecordingResult(file: await future, startedByCaller: true);
+      return await future;
     } finally {
       if (identical(stopRecordingFuture, future)) {
         stopRecordingFuture = null;
@@ -401,8 +404,8 @@ class CameraPickerState extends State<CameraPicker>
 
   /// Stop recording on the platform side without any UI side effects.
   /// 仅执行底层停止录制，不处理任何 UI 后续逻辑
-  Future<XFile?> _stopRecordingOnPlatform(CameraController controller) async {
-    _clearRecordCountdownTimer();
+  Future<XFile?> stopRecordingOnPlatform(CameraController controller) async {
+    clearRecordCountdownTimer();
     if (!controller.value.isInitialized || !controller.value.isRecordingVideo) {
       return null;
     }
@@ -411,7 +414,7 @@ class CameraPickerState extends State<CameraPicker>
 
   /// Delete a captured file if it still exists.
   /// 如果拍摄文件仍然存在，则将其删除
-  Future<void> _deleteCapturedFile(XFile file) async {
+  Future<void> deleteCapturedFile(XFile file) async {
     final capturedFile = File(file.path);
     if (!await capturedFile.exists()) {
       return;
@@ -1140,7 +1143,7 @@ class CameraPickerState extends State<CameraPicker>
       // Clear the previous countdown first to avoid the old timer stopping the
       // next recording unexpectedly.
       // 先清理上一轮的倒计时，避免旧定时器提前终止新一轮录制。
-      _clearRecordCountdownTimer();
+      clearRecordCountdownTimer();
       await controller.startVideoRecording();
       if (isRecordingRestricted) {
         recordCountdownTimer = Timer(
@@ -1159,7 +1162,7 @@ class CameraPickerState extends State<CameraPicker>
       try {
         await controller.stopVideoRecording();
       } catch (e, s) {
-        _clearRecordCountdownTimer();
+        clearRecordCountdownTimer();
         isShootingButtonAnimate = false;
         handleErrorWithHandler(e, s, pickerConfig.onError);
       } finally {
@@ -1183,7 +1186,7 @@ class CameraPickerState extends State<CameraPicker>
     final currentController = innerController;
     if (currentController == null ||
         !currentController.value.isRecordingVideo) {
-      _clearRecordCountdownTimer();
+      clearRecordCountdownTimer();
       safeSetState(() {
         isControllerBusy = false;
         isShootingButtonAnimate = false;
@@ -1195,23 +1198,22 @@ class CameraPickerState extends State<CameraPicker>
       lastShootingButtonPressedPosition = null;
     });
     try {
-      final stopResult = await _stopRecordingForController(currentController);
-      final XFile? file = stopResult.file;
+      final XFile? file = await stopRecordingForController(currentController);
       if (file == null) {
         return;
       }
-      if (!_canHandleStoppedRecording(currentController)) {
-        await _deleteCapturedFile(file);
+      if (!canHandleStoppedRecording(currentController)) {
+        await deleteCapturedFile(file);
         return;
       }
       if (recordStopwatch.elapsed < minimumRecordingDuration) {
-        await _deleteCapturedFile(file);
+        await deleteCapturedFile(file);
         pickerConfig.onMinimumRecordDurationNotMet?.call();
         return;
       }
       await currentController.pausePreview();
-      if (!_canHandleStoppedRecording(currentController)) {
-        await _deleteCapturedFile(file);
+      if (!canHandleStoppedRecording(currentController)) {
+        await deleteCapturedFile(file);
         return;
       }
       final bool? isCapturedFileHandled = pickerConfig.onXFileCaptured?.call(
@@ -1225,7 +1227,7 @@ class CameraPickerState extends State<CameraPicker>
         file: file,
         viewType: CameraPickerViewType.video,
       );
-      if (!_canHandleStoppedRecording(currentController)) {
+      if (!canHandleStoppedRecording(currentController)) {
         return;
       }
       if (entity != null) {
@@ -1239,7 +1241,7 @@ class CameraPickerState extends State<CameraPicker>
         await currentController.resumePreview();
       }
     } catch (e, s) {
-      _clearRecordCountdownTimer();
+      clearRecordCountdownTimer();
       if (mounted) {
         initCameras();
       }
@@ -2232,14 +2234,4 @@ class CameraPickerState extends State<CameraPicker>
       ),
     );
   }
-}
-
-final class _StopRecordingResult {
-  const _StopRecordingResult({
-    required this.file,
-    required this.startedByCaller,
-  });
-
-  final XFile? file;
-  final bool startedByCaller;
 }
