@@ -302,7 +302,6 @@ class CameraPickerState extends State<CameraPicker>
 
   /// Dispose the given [controller] asynchronously.
   /// 异步释放指定的控制器，子类可按需覆写销毁流程。
-  @protected
   Future<void> disposeCameraController(CameraController? controller) async {
     if (controller == null) {
       return;
@@ -350,7 +349,6 @@ class CameraPickerState extends State<CameraPicker>
   }
 
   /// 清理因生命周期中断而失效的录制状态。
-  @protected
   void clearInterruptedRecordingState() {
     recordDetectTimer?.cancel();
     recordDetectTimer = null;
@@ -364,7 +362,6 @@ class CameraPickerState extends State<CameraPicker>
   }
 
   /// 清理录制时长限制使用的倒计时定时器，避免上一轮录制影响下一轮。
-  @protected
   void clearRecordCountdownTimer() {
     recordCountdownTimer?.cancel();
     recordCountdownTimer = null;
@@ -372,13 +369,11 @@ class CameraPickerState extends State<CameraPicker>
 
   /// Whether the current state can continue handling a stopped recording.
   /// 当前页面是否仍然可以继续处理停止录制后的结果
-  @protected
   bool canHandleStoppedRecording(CameraController? controller) =>
       controller != null && mounted && identical(innerController, controller);
 
   /// Stop the active recording before disposing the controller.
   /// 在销毁控制器前停止当前录制，子类可覆写中断清理策略。
-  @protected
   Future<XFile?> stopRecordingBeforeDispose(
     CameraController? controller,
   ) async {
@@ -394,7 +389,6 @@ class CameraPickerState extends State<CameraPicker>
 
   /// Stop the platform recording once and share the same result with joiners.
   /// 执行一次底层停止录制，并让后续调用复用同一个结果
-  @protected
   Future<XFile?> stopRecordingForController(
     CameraController? controller,
   ) async {
@@ -418,7 +412,6 @@ class CameraPickerState extends State<CameraPicker>
 
   /// Stop recording on the platform side without any UI side effects.
   /// 仅执行底层停止录制，不处理任何 UI 后续逻辑
-  @protected
   Future<XFile?> stopRecordingOnPlatform(CameraController? controller) async {
     if (controller == null) {
       return null;
@@ -432,7 +425,6 @@ class CameraPickerState extends State<CameraPicker>
 
   /// Delete a captured file if it still exists.
   /// 如果拍摄文件仍然存在，则将其删除
-  @protected
   Future<void> deleteCapturedFile(XFile file) async {
     final capturedFile = File(file.path);
     if (!await capturedFile.exists()) {
